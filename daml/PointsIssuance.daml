@@ -1,0 +1,127 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module PointsIssuance where
+
+import Daml.Script
+import DA.Assert
+import LoyaltyWallet
+
+-- | Represents a merchant's proposal to issue loyalty points to a customer
+-- following a qualifying purchase. This follows the standard proposal/acceptance
+-- pattern, where the merchant proposes and the customer accepts.
+template IssuanceProposal
+  with
+    coalitionOperator : Party
+      -- ^ The operator of the loyalty coalition.
+    merchant : Party
+      -- ^ The merchant issuing the points.
+    customer : Party
+      -- ^ The customer receiving the points.
+    pointsToIssue : Points
+      -- ^ A record containing the quantity of points and the originating merchant.
+    purchaseReference : Text
+      -- ^ A unique identifier for the purchase transaction, e.g., a receipt or order ID.
+    walletCid : ContractId Wallet
+      -- ^ The contract ID of the customer's loyalty wallet where points will be deposited.
+  where
+    signatory merchant
+    observer customer, coalitionOperator
+
+    -- Ensure the merchant specified in the `pointsToIssue` record matches the
+    -- merchant creating this proposal. This is a critical data integrity check.
+    ensure pointsToIssue.merchant == merchant
+
+    key (merchant, customer, purchaseReference) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | The customer's choice to accept the loyalty points. This action archives
+    -- the proposal and deposits the points into their wallet atomically.
+    choice AcceptIssuance : ContractId Wallet
+      controller customer
+      do
+        -- Exercise the `Deposit` choice on the customer's wallet contract.
+        exercise walletCid Deposit with pointsToDeposit = pointsToIssue
+
+    -- | The customer's choice to decline the points issuance. This is useful
+    -- if the details are incorrect or if the customer does not wish to receive points.
+    choice DeclineIssuance : ()
+      controller customer
+      do
+        pure ()
+
+    -- | The merchant's choice to withdraw the proposal before it has been
+    -- accepted by the customer.
+    choice WithdrawIssuance : ()
+      controller merchant
+      do
+        pure ()
+
+-- | A Daml Script to test and demonstrate the points issuance workflow.
+issuanceScenario : Script ()
+issuanceScenario = script do
+  -- 1. Allocate parties for the scenario.
+  coalitionOperator <- allocatePartyWithHint "CoalitionOperator" (PartyIdHint "coalition-operator")
+  merchantA <- allocatePartyWithHint "MerchantA" (PartyIdHint "merchant-a")
+  customer1 <- allocatePartyWithHint "Customer1" (PartyIdHint "customer-1")
+
+  -- 2. Onboard the customer by creating a loyalty wallet for them.
+  -- The wallet is controlled by the customer, but observed by the operator.
+  walletCid <- submit customer1 do
+    createCmd Wallet with
+      customer = customer1
+      coalitionOperator = coalitionOperator
+      observers = fromParties [customer1, coalitionOperator]
+      pointsLedger = Map.empty
+
+  -- 3. The merchant makes a qualifying sale and proposes to issue points.
+  let
+    pointsForPurchase = Points with
+      merchant = merchantA
+      quantity = 100.0
+    purchaseRef = "RECEIPT-20240521-001"
+
+  proposalCid <- submit merchantA do
+    createCmd IssuanceProposal with
+      coalitionOperator = coalitionOperator
+      merchant = merchantA
+      customer = customer1
+      pointsToIssue = pointsForPurchase
+      purchaseReference = purchaseRef
+      walletCid = walletCid
+
+  -- 4. The customer accepts the points.
+  updatedWalletCid <- submit customer1 do
+    exerciseCmd proposalCid AcceptIssuance
+
+  -- 5. Verify the wallet has been updated correctly.
+  Some updatedWallet <- queryContractId customer1 updatedWalletCid
+  let expectedPoints = Map.fromList [(merchantA, 100.0)]
+  updatedWallet.pointsLedger === expectedPoints
+  debug $ "Successfully issued 100.0 points from MerchantA to Customer1. Wallet updated."
+
+  -- 6. Demonstrate the merchant withdrawing an offer.
+  let
+    secondPurchaseRef = "RECEIPT-20240521-002"
+    secondPoints = Points with merchant = merchantA, quantity = 50.0
+
+  secondProposalCid <- submit merchantA do
+    createCmd IssuanceProposal with
+      coalitionOperator = coalitionOperator
+      merchant = merchantA
+      customer = customer1
+      pointsToIssue = secondPoints
+      purchaseReference = secondPurchaseRef
+      walletCid = updatedWalletCid
+
+  -- The merchant withdraws the offer before the customer can accept.
+  submit merchantA do
+    exerciseCmd secondProposalCid WithdrawIssuance
+
+  -- Verify the proposal contract is gone.
+  None <- queryContractId merchantA secondProposalCid
+  debug "Successfully demonstrated merchant withdrawing an issuance proposal."
+
+  pure ()
