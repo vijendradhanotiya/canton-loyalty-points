@@ -1,0 +1,126 @@
+module LoyaltyWallet where
+
+import DA.Map (Map)
+import qualified DA.Map as Map
+import DA.Assert ((assert, assertMsg))
+import DA.Text (partyToText)
+import DA.Optional (fromOptional)
+
+-- | Represents a pending redemption of loyalty points that requires settlement
+-- | by the coalition operator. This contract is created when a customer
+-- | exercises the `RedeemPoints` choice on their `LoyaltyWallet`.
+template Redemption
+  with
+    customer: Party
+      -- ^ The customer who redeemed the points.
+    brand: Party
+      -- ^ The merchant (brand) where the points were redeemed.
+    coalitionOperator: Party
+      -- ^ The operator of the loyalty coalition responsible for settlement.
+    amount: Decimal
+      -- ^ The number of points redeemed.
+  where
+    signatory customer, brand
+    observer coalitionOperator
+
+    ensure amount > 0.0
+      -- Points redeemed must be a positive value.
+
+    -- A unique identifier for this redemption event could be added for more robust keying.
+    key (customer, brand, coalitionOperator, amount) : (Party, Party, Party, Decimal)
+    maintainer key._1
+
+    choice Settle : ()
+      -- ^ The coalition operator settles the redemption with the brand.
+      -- ^ In a real-world scenario, this would trigger a payment from the
+      -- ^ coalition to the brand. For this model, it simply archives the
+      -- ^ redemption claim.
+      controller coalitionOperator
+      do
+        pure ()
+
+-- | The customer's central wallet for accumulating and redeeming loyalty points
+-- | from various brands within the coalition.
+template LoyaltyWallet
+  with
+    customer: Party
+      -- ^ The owner of the wallet.
+    coalitionOperator: Party
+      -- ^ The operator of the loyalty coalition.
+    balances: Map Text Decimal
+      -- ^ A map from brand (as Party Text) to the points balance for that brand.
+  where
+    signatory customer
+    observer coalitionOperator
+
+    key (customer, coalitionOperator) : (Party, Party)
+    maintainer key._1
+
+    -- | Helper function to get the balance for a specific brand.
+    -- | Returns 0.0 if the brand is not in the map.
+    let getBalance: Party -> Decimal =
+          \p -> fromOptional 0.0 (Map.lookup (partyToText p) balances)
+
+    choice AddPoints : ContractId LoyaltyWallet
+      -- ^ The coalition operator adds points to the wallet on behalf of a brand.
+      -- ^ This typically happens after a customer makes a qualifying purchase.
+      controller coalitionOperator
+      with
+        brand: Party
+          -- ^ The brand issuing the points.
+        amount: Decimal
+          -- ^ The number of points to add.
+      do
+        assertMsg "Points to add must be positive" $ amount > 0.0
+
+        let currentBalance = getBalance brand
+        let newBalance = currentBalance + amount
+        let newBalances = Map.insert (partyToText brand) newBalance balances
+
+        create this with balances = newBalances
+
+    choice RedeemPoints : ContractId Redemption
+      -- ^ The customer redeems points at a specific brand.
+      -- ^ This reduces the point balance and creates a `Redemption` contract
+      -- ^ that the `coalitionOperator` will later settle with the `brand`.
+      controller customer
+      with
+        brand: Party
+          -- ^ The brand where points are being redeemed.
+        amount: Decimal
+          -- ^ The number of points to redeem.
+      do
+        assertMsg "Points to redeem must be positive" $ amount > 0.0
+
+        let currentBalance = getBalance brand
+        assertMsg ("Insufficient points balance for brand " <> show brand <> ". Required: " <> show amount <> ", Available: " <> show currentBalance) $
+          currentBalance >= amount
+
+        let newBalance = currentBalance - amount
+        -- If the new balance is zero, we could remove the key, but leaving it
+        -- is simpler and shows the customer has a relationship with the brand.
+        let newBalances = Map.insert (partyToText brand) newBalance balances
+
+        -- Re-create the wallet with the updated balance
+        create this with balances = newBalances
+
+        -- Create a redemption claim for the coalition operator to settle
+        create Redemption with
+          customer
+          brand
+          coalitionOperator
+          amount
+
+    nonconsuming choice ViewWallet : LoyaltyWallet
+      -- ^ Allows stakeholders to view the current state of the wallet.
+      controller customer, coalitionOperator
+      do
+        return self
+
+    nonconsuming choice GetBalanceForBrand : Decimal
+      -- ^ Allows stakeholders to query the balance for a specific brand.
+      controller customer, coalitionOperator
+      with
+        brand: Party
+      do
+        return $ getBalance brand
