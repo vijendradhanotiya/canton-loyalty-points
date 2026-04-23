@@ -1,0 +1,222 @@
+module LoyaltyTest where
+
+import Daml.Script
+import DA.Date
+import DA.Time
+import DA.Assert
+import DA.List (find)
+
+import LoyaltyWallet
+import PointsIssuance
+import Redemption
+import CoalitionClearing
+
+-- === Test Setup ===
+
+-- | Allocates the standard set of parties for the tests.
+setupParties = script do
+  coalitionOperator <- allocatePartyWithHint "CoalitionOperator" (PartyIdHint "coalition-operator")
+  customer <- allocatePartyWithHint "Customer" (PartyIdHint "customer")
+  merchantA <- allocatePartyWithHint "MerchantA" (PartyIdHint "merchant-a")
+  merchantB <- allocatePartyWithHint "MerchantB" (PartyIdHint "merchant-b")
+  return (coalitionOperator, customer, merchantA, merchantB)
+
+-- | Sets up the initial state for a test run:
+-- | - Coalition agreements and merchant roles for two merchants.
+-- | - A loyalty wallet for the customer.
+initialize = script do
+  (coalitionOperator, customer, merchantA, merchantB) <- setupParties
+
+  -- Create coalition agreements for both merchants
+  coalitionAgreementA <- submit coalitionOperator do
+    createCmd CoalitionAgreement with operator = coalitionOperator, merchant = merchantA
+  coalitionAgreementB <- submit coalitionOperator do
+    createCmd CoalitionAgreement with operator = coalitionOperator, merchant = merchantB
+
+  -- Derive the long-lived MerchantRole contracts from the agreements
+  merchantRoleA <- submit coalitionOperator do
+    exerciseCmd coalitionAgreementA GetMerchantRole
+  merchantRoleB <- submit coalitionOperator do
+    exerciseCmd coalitionAgreementB GetMerchantRole
+
+  -- Create the customer's loyalty wallet, managed by the operator
+  walletCid <- submit coalitionOperator do
+    createCmd LoyaltyWallet with
+      owner = customer
+      operator = coalitionOperator
+      points = []
+      totalBalance = 0.0
+
+  return (coalitionOperator, customer, merchantA, merchantB, walletCid, merchantRoleA, merchantRoleB)
+
+-- === Test Scenarios ===
+
+-- | Tests the complete lifecycle: issuance from multiple merchants, redemption,
+-- | and settlement of the redemption claim by the coalition operator.
+test_full_lifecycle = script do
+  (coalitionOperator, customer, merchantA, merchantB, walletCid0, merchantRoleA, merchantRoleB) <- initialize
+  let
+    issuanceAmountA = 100.0
+    issuanceAmountB = 50.0
+    redemptionAmount = 30.0
+    expectedFinalBalance = issuanceAmountA + issuanceAmountB - redemptionAmount
+
+  now <- getTime
+  let futureExpiry = addDays (toDateUTC now) 365
+
+  -- 1. Merchant A issues 100 points
+  debug "Step 1: Merchant A issues 100 points to Customer"
+  proposalA <- submit merchantA do
+    createCmd PointsIssuanceProposal with
+      merchant = merchantA, customer, merchantRoleId = merchantRoleA, walletId = walletCid0,
+      amount = issuanceAmountA, transactionId = "TXN-A-001", expiryDate = futureExpiry, observers = [coalitionOperator]
+  walletCid1 <- submit customer do exerciseCmd proposalA PointsIssuanceProposal_Accept
+  wallet1 <- fetch walletCid1
+  assertEq wallet1.totalBalance issuanceAmountA
+  assertEq (length wallet1.points) 1
+
+  -- 2. Merchant B issues 50 points
+  debug "Step 2: Merchant B issues 50 points to Customer"
+  proposalB <- submit merchantB do
+    createCmd PointsIssuanceProposal with
+      merchant = merchantB, customer, merchantRoleId = merchantRoleB, walletId = walletCid1,
+      amount = issuanceAmountB, transactionId = "TXN-B-001", expiryDate = futureExpiry, observers = [coalitionOperator]
+  walletCid2 <- submit customer do exerciseCmd proposalB PointsIssuanceProposal_Accept
+  wallet2 <- fetch walletCid2
+  assertEq wallet2.totalBalance (issuanceAmountA + issuanceAmountB)
+  assertEq (length wallet2.points) 2
+
+  -- 3. Customer redeems 30 points at Merchant A
+  debug "Step 3: Customer redeems 30 points at Merchant A"
+  redemptionRequest <- submit customer do
+    createCmd RedemptionRequest with customer, merchant = merchantA, walletId = walletCid2,
+    amount = redemptionAmount, transactionId = "TXN-R-001"
+  (walletCid3, claimCid) <- submit merchantA do exerciseCmd redemptionRequest RedemptionRequest_Accept
+  wallet3 <- fetch walletCid3
+  assertEq wallet3.totalBalance expectedFinalBalance
+
+  -- 4. Coalition Operator settles the claim
+  debug "Step 4: Coalition Operator settles the redemption claim"
+  claim <- fetch claimCid
+  assertEq claim.amount redemptionAmount
+  settledCid <- submit coalitionOperator do
+    exerciseCmd claimCid SettleClaim with settlementReference = "SETTLE-001"
+
+  -- 5. Verify final state
+  debug "Step 5: Verifying final contract states"
+  settledClaim <- fetch settledCid
+  assertEq settledClaim.merchant merchantA
+  assertEq settledClaim.amount redemptionAmount
+
+  debug "SUCCESS: test_full_lifecycle"
+
+-- | Tests that a customer cannot redeem more points from a merchant
+-- | than they hold from that specific merchant.
+test_redemption_insufficient_points = script do
+  (coalitionOperator, customer, merchantA, _, walletCid0, merchantRoleA, _) <- initialize
+  let
+    issuanceAmount = 100.0
+    redemptionAmount = 150.0
+
+  now <- getTime
+  let futureExpiry = addDays (toDateUTC now) 365
+
+  -- Issue 100 points from Merchant A
+  proposalA <- submit merchantA do
+    createCmd PointsIssuanceProposal with
+      merchant = merchantA, customer, merchantRoleId = merchantRoleA, walletId = walletCid0,
+      amount = issuanceAmount, transactionId = "TXN-A-002", expiryDate = futureExpiry, observers = [coalitionOperator]
+  walletCid1 <- submit customer do exerciseCmd proposalA PointsIssuanceProposal_Accept
+
+  -- Attempt to redeem 150 points (which is more than available)
+  redemptionRequest <- submit customer do
+    createCmd RedemptionRequest with
+      customer, merchant = merchantA, walletId = walletCid1,
+      amount = redemptionAmount, transactionId = "TXN-R-002"
+
+  -- This must fail because the wallet logic will find insufficient points.
+  submitMustFail merchantA do
+    exerciseCmd redemptionRequest RedemptionRequest_Accept
+
+  debug "SUCCESS: test_redemption_insufficient_points"
+
+-- | Tests the point expiry logic. Issues one batch of points that has already
+-- | expired and one that is still valid, then runs the expiry process.
+test_point_expiry = script do
+  (coalitionOperator, customer, merchantA, merchantB, walletCid0, merchantRoleA, merchantRoleB) <- initialize
+  now <- getTime
+  let
+    pastExpiry = addDays (toDateUTC now) (-1)
+    futureExpiry = addDays (toDateUTC now) 365
+    expiredAmount = 75.0
+    validAmount = 50.0
+
+  -- Issue expired points from Merchant A
+  proposalA <- submit merchantA do
+    createCmd PointsIssuanceProposal with
+      merchant = merchantA, customer, merchantRoleId = merchantRoleA, walletId = walletCid0,
+      amount = expiredAmount, transactionId = "TXN-A-003", expiryDate = pastExpiry, observers = [coalitionOperator]
+  walletCid1 <- submit customer do exerciseCmd proposalA PointsIssuanceProposal_Accept
+
+  -- Issue valid points from Merchant B
+  proposalB <- submit merchantB do
+    createCmd PointsIssuanceProposal with
+      merchant = merchantB, customer, merchantRoleId = merchantRoleB, walletId = walletCid1,
+      amount = validAmount, transactionId = "TXN-B-002", expiryDate = futureExpiry, observers = [coalitionOperator]
+  walletCid2 <- submit customer do exerciseCmd proposalB PointsIssuanceProposal_Accept
+
+  walletBeforeExpiry <- fetch walletCid2
+  assertEq walletBeforeExpiry.totalBalance (expiredAmount + validAmount)
+
+  -- Operator runs the expiry process on the wallet
+  walletCid3 <- submit coalitionOperator do
+    exerciseCmd walletCid2 ExpirePoints with currentTime = now
+
+  -- Verify that only the valid points remain
+  walletAfterExpiry <- fetch walletCid3
+  debug $ "Wallet after expiry: " <> show walletAfterExpiry
+  assertEq walletAfterExpiry.totalBalance validAmount
+  assertEq (length walletAfterExpiry.points) 1
+
+  let (Some remainingPoints) = find (\p -> p.issuingMerchant == merchantB) walletAfterExpiry.points
+  assertEq remainingPoints.amount validAmount
+
+  debug "SUCCESS: test_point_expiry"
+
+-- | Tests that a party without a valid, operator-issued `MerchantRole` cannot
+-- | successfully issue points to a customer's wallet.
+test_unauthorized_issuance_fails = script do
+  (coalitionOperator, customer, merchantA, _, walletCid0, merchantRoleA, _) <- initialize
+  unauthorizedMerchant <- allocatePartyWithHint "UnauthorizedMerchant" (PartyIdHint "unauthorized-merchant")
+
+  now <- getTime
+  let futureExpiry = addDays (toDateUTC now) 365
+
+  -- The unauthorized merchant creates a proposal, but maliciously uses the role ID
+  -- of a valid merchant (Merchant A).
+  proposal <- submit unauthorizedMerchant do
+    createCmd PointsIssuanceProposal with
+      merchant = unauthorizedMerchant
+      customer = customer
+      merchantRoleId = merchantRoleA -- Using a role that doesn't belong to it
+      walletId = walletCid0
+      amount = 100.0
+      transactionId = "TXN-U-001"
+      expiryDate = futureExpiry
+      observers = [coalitionOperator]
+
+  -- The customer attempts to accept. This must fail inside the `LoyaltyWallet_AddPoints`
+  -- choice, which validates that the issuer of the points (`unauthorizedMerchant`)
+  -- matches the merchant on the fetched `MerchantRole` contract.
+  submitMustFail customer do
+    exerciseCmd proposal PointsIssuanceProposal_Accept
+
+  debug "SUCCESS: test_unauthorized_issuance_fails"
+
+
+-- | Main test suite that runs all loyalty program tests.
+loyalty_tests = script do
+  test_full_lifecycle
+  test_redemption_insufficient_points
+  test_point_expiry
+  test_unauthorized_issuance_fails
