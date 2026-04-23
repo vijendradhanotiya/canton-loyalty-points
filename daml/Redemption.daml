@@ -1,0 +1,159 @@
+module Redemption where
+
+import Daml.Script
+import DA.Set (Set, fromList, toList)
+import DA.Assert
+import DA.Time (getTime)
+import DA.Foldable (sum)
+
+import PointsIssuance (IssuedPoints(..))
+
+-- | Defines a reward item available for redemption from a merchant's catalogue.
+data RewardItem = RewardItem
+  with
+    itemId: Text      -- ^ A unique identifier for the reward item.
+    description: Text -- ^ A description of the reward.
+    pointsCost: Decimal -- ^ The number of loyalty points required to redeem this item.
+  deriving (Eq, Show)
+
+-- | A proposal from a customer to redeem a set of their loyalty points for a specific reward.
+-- The customer selects which specific points contracts (UTXOs) they wish to spend.
+template RedemptionProposal
+  with
+    customer: Party
+    merchant: Party
+    coalitionOperator: Party
+    reward: RewardItem
+    pointsCids: Set (ContractId IssuedPoints) -- ^ The specific points contracts to be consumed.
+  where
+    signatory customer
+    observer merchant, coalitionOperator
+
+    ensure
+      reward.pointsCost > 0.0 && not (null $ toList pointsCids)
+
+    key (customer, merchant, reward.itemId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | The merchant accepts the redemption proposal, consuming the points and creating a
+    -- | record of the redemption. If the points provided exceed the cost, change is returned
+    -- | to the customer in the form of a new IssuedPoints contract.
+    choice AcceptRedemption : ContractId RedeemedPoints
+      controller merchant
+      do
+        -- Fetch all the provided points contracts to validate them.
+        pointsContracts <- mapA fetch (toList pointsCids)
+
+        -- 1. Validate the points belong to the correct customer and merchant.
+        let totalPoints = sum (map (.points) pointsContracts)
+        assertMsg "Insufficient points provided for redemption" (totalPoints >= reward.pointsCost)
+        assertMsg "All points must belong to the proposing customer"
+          (all (\p -> p.customer == customer) pointsContracts)
+        assertMsg "Points can only be redeemed with the issuing merchant"
+          (all (\p -> p.merchant == merchant) pointsContracts)
+        assertMsg "Points must be issued under the correct coalition operator"
+          (all (\p -> p.coalitionOperator == coalitionOperator) pointsContracts)
+
+        -- 2. Archive the consumed points contracts.
+        mapA_ archive (toList pointsCids)
+
+        -- 3. If there's an overpayment, issue change back to the customer.
+        let change = totalPoints - reward.pointsCost
+        when (change > 0.0) do
+          create IssuedPoints with
+            customer
+            merchant
+            coalitionOperator
+            points = change
+
+        -- 4. Create a record of the completed redemption.
+        now <- getTime
+        create RedeemedPoints with
+          customer
+          merchant
+          coalitionOperator
+          reward
+          redeemedAt = now
+
+-- | A record of a completed points redemption. This contract acts as an immutable,
+-- | auditable event on the ledger. It could be used by the coalition operator for
+-- | settlement and analytics.
+template RedeemedPoints
+  with
+    customer: Party
+    merchant: Party
+    coalitionOperator: Party
+    reward: RewardItem
+    redeemedAt: Time
+  where
+    signatory customer, merchant
+    observer coalitionOperator
+
+
+-- | Test script for the redemption workflow.
+test_redemption_workflow : Script ()
+test_redemption_workflow = script do
+  -- 1. Setup Parties
+  coalitionOperator <- allocatePartyWithHint "CoalitionOp" (PartyIdHint "coalitionop")
+  merchant <- allocatePartyWithHint "SuperMart" (PartyIdHint "supermart")
+  customer <- allocatePartyWithHint "Alice" (PartyIdHint "alice")
+
+  -- 2. Setup initial state: Customer needs some points.
+  -- Issue two separate points contracts to the customer from the same merchant.
+  pointsCid1 <- submit merchant do
+    createCmd IssuedPoints with customer, merchant, coalitionOperator, points = 1000.0
+  pointsCid2 <- submit merchant do
+    createCmd IssuedPoints with customer, merchant, coalitionOperator, points = 500.0
+
+  -- 3. Define the reward the customer wants to redeem.
+  let reward = RewardItem with
+        itemId = "REWARD-001"
+        description = "Free Coffee"
+        pointsCost = 1200.0
+
+  -- 4. Customer initiates redemption
+  -- The customer chooses to spend both of their points contracts.
+  let pointsToSpend = fromList [pointsCid1, pointsCid2]
+  proposalCid <- submit customer do
+    createCmd RedemptionProposal with customer, merchant, coalitionOperator, reward, pointsCids = pointsToSpend
+
+  -- 5. Merchant accepts the redemption
+  redeemedCid <- submit merchant do
+    exerciseCmd proposalCid AcceptRedemption
+
+  -- 6. Verify the final state
+  -- a) The original proposal and points contracts should be archived.
+  queryResultProposal <- queryContractId customer proposalCid
+  assert (queryResultProposal == None)
+  queryResultPoints1 <- queryContractId customer pointsCid1
+  assert (queryResultPoints1 == None)
+  queryResultPoints2 <- queryContractId customer pointsCid2
+  assert (queryResultPoints2 == None)
+
+  -- b) A RedeemedPoints contract should exist.
+  redeemedContract <- fetch redeemedCid
+  assert (redeemedContract.customer == customer)
+  assert (redeemedContract.reward.pointsCost == 1200.0)
+
+  -- c) A new IssuedPoints contract for the change (1000 + 500 - 1200 = 300) should exist.
+  (changeCid, changeContract) <- querySingle @IssuedPoints customer
+  assert (changeContract.customer == customer)
+  assert (changeContract.merchant == merchant)
+  assert (changeContract.points == 300.0)
+
+  -- 7. Test failure case: Insufficient points
+  -- Try to redeem a 500 point item with a 300 point contract.
+  let expensiveReward = reward with itemId = "REWARD-002", pointsCost = 500.0
+  let pointsToSpendInsufficient = fromList [changeCid]
+
+  insufficientProposalCid <- submit customer do
+    createCmd RedemptionProposal with customer, merchant, coalitionOperator, reward = expensiveReward, pointsCids = pointsToSpendInsufficient
+
+  -- This should fail with the "Insufficient points" message.
+  submitMustFail merchant do
+    exerciseCmd insufficientProposalCid AcceptRedemption
+
+  -- Cleanup the last proposal
+  submit customer do exerciseCmd insufficientProposalCid (Archive)
+
+  pure ()
