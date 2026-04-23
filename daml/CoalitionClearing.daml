@@ -1,0 +1,165 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module CoalitionClearing where
+
+import Daml.Script
+
+import Redemption (RedeemedPoints)
+
+-- | Represents a request from a merchant to the coalition operator to be reimbursed
+-- for points they accepted from a customer, which were originally issued by another
+-- merchant in the coalition.
+-- This is the first step in the inter-merchant settlement process.
+template ClearingRequest
+  with
+    coalitionOperator : Party
+      -- ^ The central operator of the loyalty coalition.
+    creditorMerchant : Party
+      -- ^ The merchant who accepted the points and is owed money (the redeemer).
+    debtorMerchant : Party
+      -- ^ The merchant who issued the points and owes money.
+    amount : Decimal
+      -- ^ The monetary value to be settled, corresponding to the points redeemed.
+    redemptionCid : ContractId RedeemedPoints
+      -- ^ A reference to the original redemption transaction.
+  where
+    signatory coalitionOperator, creditorMerchant
+
+    observer debtorMerchant
+
+    ensure amount > 0.0
+
+    choice Acknowledge : ContractId PendingSettlement
+      -- ^ The debtor merchant acknowledges the debt, moving it to a pending settlement state.
+      controller debtorMerchant
+      do
+        create PendingSettlement with
+          coalitionOperator = coalitionOperator
+          creditorMerchant = creditorMerchant
+          debtorMerchant = debtorMerchant
+          amount = amount
+          originalRedemptionCid = redemptionCid
+
+-- | Represents an acknowledged debt between two merchants that is awaiting final
+-- settlement by the coalition operator.
+-- This contract is created once the debtor merchant has acknowledged the clearing request.
+template PendingSettlement
+  with
+    coalitionOperator : Party
+      -- ^ The central operator of the loyalty coalition.
+    creditorMerchant : Party
+      -- ^ The merchant who is owed the settlement amount.
+    debtorMerchant : Party
+      -- ^ The merchant who owes the settlement amount.
+    amount : Decimal
+      -- ^ The settlement amount.
+    originalRedemptionCid : ContractId RedeemedPoints
+      -- ^ A reference to the original redemption transaction for audit purposes.
+  where
+    signatory coalitionOperator, creditorMerchant, debtorMerchant
+
+    ensure amount > 0.0
+
+    choice Settle : ContractId SettlementConfirmation
+      -- ^ The coalition operator confirms that the off-ledger payment has been made
+      -- and settles the debt on the ledger.
+      with
+        settlementReference : Text
+          -- ^ A reference to the off-ledger payment (e.g., bank transaction ID).
+      controller coalitionOperator
+      do
+        settlementTime <- getTime
+        create SettlementConfirmation with
+          coalitionOperator = coalitionOperator
+          creditorMerchant = creditorMerchant
+          debtorMerchant = debtorMerchant
+          amount = amount
+          originalRedemptionCid = originalRedemptionCid
+          settledAt = settlementTime
+          settlementReference = settlementReference
+
+-- | A final, immutable record confirming that a settlement has occurred between
+-- two merchants, facilitated by the coalition operator.
+-- This serves as a verifiable audit trail for completed settlements.
+template SettlementConfirmation
+  with
+    coalitionOperator : Party
+      -- ^ The central operator of the loyalty coalition.
+    creditorMerchant : Party
+      -- ^ The merchant who received the payment.
+    debtorMerchant : Party
+      -- ^ The merchant who made the payment.
+    amount : Decimal
+      -- ^ The settled amount.
+    originalRedemptionCid : ContractId RedeemedPoints
+      -- ^ Reference to the redemption that initiated the settlement.
+    settledAt : Time
+      -- ^ The timestamp of the settlement confirmation.
+    settlementReference : Text
+      -- ^ A reference to the off-ledger payment transaction.
+  where
+    signatory coalitionOperator, creditorMerchant, debtorMerchant
+
+-- | Daml Script tests for the coalition clearing workflow.
+test_clearing_workflow : Script ()
+test_clearing_workflow = script do
+  -- 1. Setup parties
+  operator <- allocatePartyWithHint "CoalitionOperator" (PartyIdHint "operator")
+  brandA <- allocatePartyWithHint "BrandA" (PartyIdHint "branda")
+  brandB <- allocatePartyWithHint "BrandB" (PartyIdHint "brandb")
+  customer <- allocatePartyWithHint "Customer" (PartyIdHint "customer")
+
+  -- 2. Setup initial state (a dummy RedeemedPoints contract)
+  -- In a real scenario, this would be created by the Redemption.Redeem choice.
+  -- Here, we create it directly for testing purposes.
+  let redemptionAmount = 50.0
+  redeemedPointsCid <- submit brandB do
+    createCmd RedeemedPoints with
+      customer = customer
+      redeemingMerchant = brandB -- Customer redeems Brand A's points at Brand B's store
+      issuingBrand = brandA
+      points = 500.0
+      monetaryValue = redemptionAmount
+      redeemedAt = time (date 2024 Feb 27) 10 0 0
+
+  -- 3. Create ClearingRequest
+  -- Brand B (the creditor) requests settlement from the operator.
+  clearingRequestCid <- submitMulti [operator, brandB] [] do
+    createCmd ClearingRequest with
+      coalitionOperator = operator
+      creditorMerchant = brandB
+      debtorMerchant = brandA
+      amount = redemptionAmount
+      redemptionCid = redeemedPointsCid
+  
+  -- 4. Acknowledge the request
+  -- Brand A (the debtor) acknowledges the request, creating a PendingSettlement.
+  pendingSettlementCid <- submit brandA do
+    exerciseCmd clearingRequestCid Acknowledge
+
+  -- 5. Settle the payment
+  -- The operator confirms off-ledger payment and settles the contract.
+  let paymentRef = "BANK-TX-12345"
+  confirmationCid <- submit operator do
+    exerciseCmd pendingSettlementCid (Settle with settlementReference = paymentRef)
+
+  -- 6. Verify final state
+  confirmation <- fetch confirmationCid
+  confirmation.amount === redemptionAmount
+  confirmation.creditorMerchant === brandB
+  confirmation.debtorMerchant === brandA
+  confirmation.settlementReference === paymentRef
+
+  -- Verify archival of intermediate contracts
+  fetch active (fromContractId clearingRequestCid) >>= \case
+    None -> return ()
+    Some _ -> abort "ClearingRequest should have been archived"
+  
+  fetch active (fromContractId pendingSettlementCid) >>= \case
+    None -> return ()
+    Some _ -> abort "PendingSettlement should have been archived"
+
+  pure ()
